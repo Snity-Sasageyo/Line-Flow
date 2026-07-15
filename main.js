@@ -3,7 +3,8 @@ const ctx = board.getContext('2d');
 
 let halted = false;
 const swarm = [];
-const count = 350;
+const eddies = [];
+const count = 400;
 const palette = ['#EAEAEA', '#7A7A7A'];
 let fieldShift = 0;
 
@@ -25,7 +26,7 @@ const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
 const lerp = (a, b, t) => a + t * (b - a);
 
 const getAngle = (px, py) => {
-    const scale = 0.0025;
+    const scale = 0.002;
     const xi = Math.floor(px * scale);
     const yi = Math.floor(py * scale);
     const xf = (px * scale) - xi;
@@ -44,6 +45,25 @@ const getAngle = (px, py) => {
     return lerp(top, bot, v) * Math.PI * 4;
 };
 
+class Eddy {
+    constructor() {
+        this.x = Math.random() * board.width;
+        this.y = Math.random() * board.height;
+        this.vx = (Math.random() - 0.5) * 0.4;
+        this.vy = (Math.random() - 0.5) * 0.4;
+        this.rad = 120 + Math.random() * 280;
+        this.radSq = this.rad * this.rad;
+        this.pull = (Math.random() > 0.5 ? 1 : -1) * (0.2 + Math.random() * 0.6);
+    }
+    
+    drift() {
+        this.x += this.vx;
+        this.y += this.vy;
+        if (this.x < -150 || this.x > board.width + 150) this.vx *= -1;
+        if (this.y < -150 || this.y > board.height + 150) this.vy *= -1;
+    }
+}
+
 class Mote {
     constructor() {
         this.revive();
@@ -55,9 +75,10 @@ class Mote {
         this.px = this.x;
         this.py = this.y;
         this.angle = Math.random() * Math.PI * 2;
-        this.vel = 0.8 + Math.random() * 1.2;
-        this.life = 400 + Math.random() * 600;
+        this.vel = 0.6 + Math.random() * 1.4;
+        this.life = 300 + Math.random() * 700;
         this.hue = palette[Math.floor(Math.random() * palette.length)];
+        this.track = [];
     }
 
     step() {
@@ -70,20 +91,65 @@ class Mote {
         this.py = this.y;
 
         let target = getAngle(this.x, this.y);
-        let diff = target - this.angle;
         
+        for (let e of eddies) {
+            let dx = this.x - e.x;
+            let dy = this.y - e.y;
+            let distSq = dx * dx + dy * dy;
+            if (distSq < e.radSq) {
+                let dist = Math.sqrt(distSq);
+                let weight = (1 - dist / e.rad) * Math.abs(e.pull);
+                let tang = Math.atan2(dy, dx) + (e.pull > 0 ? -Math.PI / 2 : Math.PI / 2);
+                
+                let tDiff = tang - target;
+                while (tDiff > Math.PI) tDiff -= Math.PI * 2;
+                while (tDiff < -Math.PI) tDiff += Math.PI * 2;
+                target += tDiff * weight;
+            }
+        }
+
+        let diff = target - this.angle;
         while (diff > Math.PI) diff -= Math.PI * 2;
         while (diff < -Math.PI) diff += Math.PI * 2;
         
-        this.angle += diff * 0.05;
-        this.angle += (Math.random() - 0.5) * 0.05;
+        this.angle += diff * 0.06;
+        this.angle += (Math.random() - 0.5) * 0.03;
 
-        this.x += Math.cos(this.angle) * this.vel;
-        this.y += Math.sin(this.angle) * this.vel;
+        let nx = this.x + Math.cos(this.angle) * this.vel;
+        let ny = this.y + Math.sin(this.angle) * this.vel;
+
+        if (nx < 0 || nx > board.width) {
+            this.angle = Math.PI - this.angle;
+            nx = Math.max(0, Math.min(board.width, nx));
+        }
+        if (ny < 0 || ny > board.height) {
+            this.angle = -this.angle;
+            ny = Math.max(0, Math.min(board.height, ny));
+        }
+
+        this.x = nx;
+        this.y = ny;
         this.life -= 1;
 
-        if (this.x < -50 || this.x > board.width + 50 || this.y < -50 || this.y > board.height + 50) {
-            this.revive();
+        this.track.push(this.x, this.y);
+        if (this.track.length > 60) {
+            this.track.shift();
+            this.track.shift();
+        }
+
+        if (this.life % 45 === 0 && this.track.length === 60) {
+            let minX = this.x, maxX = this.x, minY = this.y, maxY = this.y;
+            for (let i = 0; i < this.track.length; i += 2) {
+                let tx = this.track[i];
+                let ty = this.track[i+1];
+                if (tx < minX) minX = tx;
+                if (tx > maxX) maxX = tx;
+                if (ty < minY) minY = ty;
+                if (ty > maxY) maxY = ty;
+            }
+            if ((maxX - minX) < 12 && (maxY - minY) < 12) {
+                this.revive();
+            }
         }
     }
 }
@@ -91,6 +157,9 @@ class Mote {
 const buildSwarm = () => {
     for (let i = 0; i < count; i++) {
         swarm.push(new Mote());
+    }
+    for (let i = 0; i < 5; i++) {
+        eddies.push(new Eddy());
     }
 };
 
@@ -126,9 +195,8 @@ const drawBatch = () => {
 
 const tick = () => {
     if (!halted) {
-        for (let m of swarm) {
-            m.step();
-        }
+        for (let e of eddies) e.drift();
+        for (let m of swarm) m.step();
         drawBatch();
     }
     requestAnimationFrame(tick);
