@@ -4,13 +4,26 @@ const ctx = board.getContext('2d');
 let halted = false;
 const swarm = [];
 const eddies = [];
-const count = 400;
+const maxCount = 500;
+let activeCount = maxCount;
 const palette = ['#EAEAEA', '#7A7A7A'];
-let fieldShift = 0;
+let epoch = 0;
+let epochDrift = 0;
+let lastStamp = 0;
+let frameBudget = 16.6;
+let budgetSmooth = 16.6;
+
+const gridCols = 8;
+const gridRows = 6;
+let cellW = 0;
+let cellH = 0;
+const grid = [];
 
 const resize = () => {
     board.width = window.innerWidth;
     board.height = window.innerHeight;
+    cellW = board.width / gridCols;
+    cellH = board.height / gridRows;
 };
 
 window.addEventListener('resize', resize);
@@ -26,46 +39,64 @@ const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
 const lerp = (a, b, t) => a + t * (b - a);
 
 const getAngle = (px, py) => {
-    const scale = 0.002;
+    const scale = 0.0018;
     const xi = Math.floor(px * scale);
     const yi = Math.floor(py * scale);
     const xf = (px * scale) - xi;
     const yf = (py * scale) - yi;
 
-    const v1 = hash(xi + fieldShift, yi);
-    const v2 = hash(xi + 1 + fieldShift, yi);
-    const v3 = hash(xi + fieldShift, yi + 1);
-    const v4 = hash(xi + 1 + fieldShift, yi + 1);
+    const seed = Math.floor(epochDrift);
+    const v1 = hash(xi + seed, yi);
+    const v2 = hash(xi + 1 + seed, yi);
+    const v3 = hash(xi + seed, yi + 1);
+    const v4 = hash(xi + 1 + seed, yi + 1);
 
     const u = fade(xf);
     const v = fade(yf);
 
-    const top = lerp(v1, v2, u);
-    const bot = lerp(v3, v4, u);
-    return lerp(top, bot, v) * Math.PI * 4;
+    return lerp(lerp(v1, v2, u), lerp(v3, v4, u), v) * Math.PI * 4;
+};
+
+const getFieldDensity = (px, py) => {
+    const col = Math.min(gridCols - 1, Math.max(0, Math.floor(px / cellW)));
+    const row = Math.min(gridRows - 1, Math.max(0, Math.floor(py / cellH)));
+    return grid[row * gridCols + col] || 0;
+};
+
+const rebuildGrid = () => {
+    for (let i = 0; i < grid.length; i++) grid[i] = 0;
+    for (let i = 0; i < activeCount; i++) {
+        const m = swarm[i];
+        const col = Math.min(gridCols - 1, Math.max(0, Math.floor(m.x / cellW)));
+        const row = Math.min(gridRows - 1, Math.max(0, Math.floor(m.y / cellH)));
+        grid[row * gridCols + col]++;
+    }
 };
 
 class Eddy {
     constructor() {
         this.x = Math.random() * board.width;
         this.y = Math.random() * board.height;
-        this.vx = (Math.random() - 0.5) * 0.4;
-        this.vy = (Math.random() - 0.5) * 0.4;
-        this.rad = 120 + Math.random() * 280;
+        this.vx = (Math.random() - 0.5) * 0.35;
+        this.vy = (Math.random() - 0.5) * 0.35;
+        this.rad = 100 + Math.random() * 300;
         this.radSq = this.rad * this.rad;
-        this.pull = (Math.random() > 0.5 ? 1 : -1) * (0.2 + Math.random() * 0.6);
+        this.pull = (Math.random() > 0.5 ? 1 : -1) * (0.15 + Math.random() * 0.55);
+        this.phase = Math.random() * Math.PI * 2;
     }
-    
-    drift() {
-        this.x += this.vx;
-        this.y += this.vy;
-        if (this.x < -150 || this.x > board.width + 150) this.vx *= -1;
-        if (this.y < -150 || this.y > board.height + 150) this.vy *= -1;
+
+    drift(dt) {
+        this.phase += 0.003 * dt;
+        this.x += this.vx * dt + Math.sin(this.phase) * 0.15;
+        this.y += this.vy * dt + Math.cos(this.phase * 0.7) * 0.15;
+        if (this.x < -200 || this.x > board.width + 200) this.vx *= -1;
+        if (this.y < -200 || this.y > board.height + 200) this.vy *= -1;
     }
 }
 
 class Mote {
-    constructor() {
+    constructor(stagger) {
+        this.birthDelay = stagger ? Math.floor(Math.random() * 120) : 0;
         this.revive();
     }
 
@@ -75,13 +106,21 @@ class Mote {
         this.px = this.x;
         this.py = this.y;
         this.angle = Math.random() * Math.PI * 2;
-        this.vel = 0.6 + Math.random() * 1.4;
-        this.life = 300 + Math.random() * 700;
+        this.baseVel = 0.5 + Math.random() * 1.3;
+        this.vel = this.baseVel;
+        this.life = 250 + Math.random() * 750;
+        this.maxLife = this.life;
         this.hue = palette[Math.floor(Math.random() * palette.length)];
         this.track = [];
+        this.stuckFrames = 0;
     }
 
-    step() {
+    step(dt) {
+        if (this.birthDelay > 0) {
+            this.birthDelay -= dt;
+            return;
+        }
+
         if (this.life <= 0) {
             this.revive();
             return;
@@ -91,101 +130,131 @@ class Mote {
         this.py = this.y;
 
         let target = getAngle(this.x, this.y);
-        
+
         for (let e of eddies) {
             let dx = this.x - e.x;
             let dy = this.y - e.y;
             let distSq = dx * dx + dy * dy;
-            if (distSq < e.radSq) {
+            if (distSq < e.radSq && distSq > 1) {
                 let dist = Math.sqrt(distSq);
-                let weight = (1 - dist / e.rad) * Math.abs(e.pull);
-                let tang = Math.atan2(dy, dx) + (e.pull > 0 ? -Math.PI / 2 : Math.PI / 2);
-                
+                let weight = (1 - dist / e.rad);
+                weight = weight * weight * Math.abs(e.pull);
+                let tang = Math.atan2(dy, dx) + (e.pull > 0 ? -1.5708 : 1.5708);
+
                 let tDiff = tang - target;
-                while (tDiff > Math.PI) tDiff -= Math.PI * 2;
-                while (tDiff < -Math.PI) tDiff += Math.PI * 2;
+                while (tDiff > Math.PI) tDiff -= 6.2832;
+                while (tDiff < -Math.PI) tDiff += 6.2832;
                 target += tDiff * weight;
             }
         }
 
         let diff = target - this.angle;
-        while (diff > Math.PI) diff -= Math.PI * 2;
-        while (diff < -Math.PI) diff += Math.PI * 2;
-        
-        this.angle += diff * 0.06;
-        this.angle += (Math.random() - 0.5) * 0.03;
+        while (diff > Math.PI) diff -= 6.2832;
+        while (diff < -Math.PI) diff += 6.2832;
 
-        let nx = this.x + Math.cos(this.angle) * this.vel;
-        let ny = this.y + Math.sin(this.angle) * this.vel;
+        this.angle += diff * 0.055 * dt;
+        this.angle += (Math.random() - 0.5) * 0.025 * dt;
 
-        if (nx < 0 || nx > board.width) {
-            this.angle = Math.PI - this.angle;
-            nx = Math.max(0, Math.min(board.width, nx));
-        }
-        if (ny < 0 || ny > board.height) {
-            this.angle = -this.angle;
-            ny = Math.max(0, Math.min(board.height, ny));
-        }
+        let density = getFieldDensity(this.x, this.y);
+        let dampen = density > 18 ? 0.4 : density > 10 ? 0.7 : 1.0;
+        this.vel = this.baseVel * dampen;
+
+        let nx = this.x + Math.cos(this.angle) * this.vel * dt;
+        let ny = this.y + Math.sin(this.angle) * this.vel * dt;
+
+        if (nx < 0) { this.angle = Math.PI - this.angle; nx = -nx; }
+        else if (nx > board.width) { this.angle = Math.PI - this.angle; nx = 2 * board.width - nx; }
+        if (ny < 0) { this.angle = -this.angle; ny = -ny; }
+        else if (ny > board.height) { this.angle = -this.angle; ny = 2 * board.height - ny; }
 
         this.x = nx;
         this.y = ny;
-        this.life -= 1;
+        this.life -= dt;
 
         this.track.push(this.x, this.y);
-        if (this.track.length > 60) {
+        if (this.track.length > 80) {
             this.track.shift();
             this.track.shift();
         }
 
-        if (this.life % 45 === 0 && this.track.length === 60) {
+        if (this.track.length >= 80) {
             let minX = this.x, maxX = this.x, minY = this.y, maxY = this.y;
             for (let i = 0; i < this.track.length; i += 2) {
-                let tx = this.track[i];
-                let ty = this.track[i+1];
-                if (tx < minX) minX = tx;
-                if (tx > maxX) maxX = tx;
-                if (ty < minY) minY = ty;
-                if (ty > maxY) maxY = ty;
+                if (this.track[i] < minX) minX = this.track[i];
+                if (this.track[i] > maxX) maxX = this.track[i];
+                if (this.track[i + 1] < minY) minY = this.track[i + 1];
+                if (this.track[i + 1] > maxY) maxY = this.track[i + 1];
             }
-            if ((maxX - minX) < 12 && (maxY - minY) < 12) {
-                this.revive();
+            if ((maxX - minX) < 10 && (maxY - minY) < 10) {
+                this.stuckFrames += dt;
+                if (this.stuckFrames > 30) this.revive();
+            } else {
+                this.stuckFrames = 0;
             }
         }
     }
 }
 
 const buildSwarm = () => {
-    for (let i = 0; i < count; i++) {
-        swarm.push(new Mote());
+    for (let i = 0; i < maxCount; i++) {
+        swarm.push(new Mote(true));
     }
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 6; i++) {
         eddies.push(new Eddy());
+    }
+    for (let i = 0; i < gridCols * gridRows; i++) {
+        grid.push(0);
     }
 };
 
 const wipe = () => {
     ctx.fillStyle = '#111';
     ctx.fillRect(0, 0, board.width, board.height);
-    fieldShift += Math.random() * 100;
+    epoch++;
+    epochDrift += 37 + Math.random() * 60;
     swarm.forEach(m => m.revive());
+    eddies.forEach(e => {
+        e.x = Math.random() * board.width;
+        e.y = Math.random() * board.height;
+    });
+};
+
+const adjustPool = () => {
+    if (budgetSmooth > 20 && activeCount > 120) {
+        activeCount -= 10;
+    } else if (budgetSmooth < 14 && activeCount < maxCount) {
+        activeCount += 5;
+    }
 };
 
 const drawBatch = () => {
-    const groups = {};
-    palette.forEach(c => groups[c] = []);
+    const light = [];
+    const dim = [];
 
-    for (let m of swarm) {
-        groups[m.hue].push(m);
+    for (let i = 0; i < activeCount; i++) {
+        const m = swarm[i];
+        if (m.birthDelay > 0) continue;
+        if (m.hue === '#EAEAEA') light.push(m);
+        else dim.push(m);
     }
 
     ctx.lineWidth = 1;
     ctx.lineCap = 'butt';
 
-    for (let color in groups) {
-        if (groups[color].length === 0) continue;
-        ctx.strokeStyle = color;
+    if (dim.length) {
+        ctx.strokeStyle = '#7A7A7A';
         ctx.beginPath();
-        for (let m of groups[color]) {
+        for (let m of dim) {
+            ctx.moveTo(m.px, m.py);
+            ctx.lineTo(m.x, m.y);
+        }
+        ctx.stroke();
+    }
+
+    if (light.length) {
+        ctx.strokeStyle = '#EAEAEA';
+        ctx.beginPath();
+        for (let m of light) {
             ctx.moveTo(m.px, m.py);
             ctx.lineTo(m.x, m.y);
         }
@@ -193,18 +262,37 @@ const drawBatch = () => {
     }
 };
 
-const tick = () => {
+const tick = (stamp) => {
+    if (!lastStamp) lastStamp = stamp;
+    let raw = stamp - lastStamp;
+    lastStamp = stamp;
+
+    if (raw > 100) raw = 16.6;
+    let dt = raw / 16.6;
+
+    budgetSmooth = budgetSmooth * 0.92 + raw * 0.08;
+
     if (!halted) {
-        for (let e of eddies) e.drift();
-        for (let m of swarm) m.step();
+        epochDrift += 0.002 * dt;
+
+        rebuildGrid();
+
+        for (let e of eddies) e.drift(dt);
+        for (let i = 0; i < activeCount; i++) swarm[i].step(dt);
+
         drawBatch();
+
+        if (epoch % 1 === 0 && Math.random() < 0.005) adjustPool();
     }
+
     requestAnimationFrame(tick);
 };
 
 document.addEventListener('keydown', (e) => {
     if (e.code === 'Space') {
+        e.preventDefault();
         halted = !halted;
+        if (!halted) lastStamp = 0;
     } else if (e.code === 'KeyR') {
         wipe();
     }
@@ -212,4 +300,5 @@ document.addEventListener('keydown', (e) => {
 
 buildSwarm();
 wipe();
-tick();
+requestAnimationFrame(tick);
+
